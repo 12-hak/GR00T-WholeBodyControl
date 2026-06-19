@@ -2290,6 +2290,30 @@ class G1Deploy {
         throw std::runtime_error("Failed to load motion data");
       }
       
+      // Initialize planner before policy/encoder so TRT conversion has free GPU memory
+      if (!planner_path.empty()) {
+        PlannerConfig planner_config;
+        planner_config.model_path = planner_path;
+        if (planner_path.find("V0") != std::string::npos)
+        {
+          planner_config.version = 0;
+        }
+        else if (planner_path.find("V1") != std::string::npos)
+        {
+          planner_config.version = 1;
+        }
+        else if (planner_path.find("V2") != std::string::npos)
+        {
+          planner_config.version = 2;
+        }
+        else
+        {
+          std::cout << "Unsupported planner version: " << planner_path << std::endl;
+          throw std::runtime_error("Unsupported planner version: " + planner_path);
+        }
+        planner_ = std::make_unique<LocalMotionPlannerTensorRT>(planner_fp16, 0, planner_config);
+      }
+
       // Initialize control policy
       policy_engine_ = std::make_unique<PolicyEngine>();
       
@@ -2389,30 +2413,6 @@ class G1Deploy {
       planner_motion_->SetEncodeMode(initial_encoder_mode_);
       std::cout << "Planner motion encode_mode set to: " << initial_encoder_mode_ << std::endl;
 
-      // Initialize planner
-      if (!planner_path.empty()) {
-        PlannerConfig planner_config;
-        planner_config.model_path = planner_path;
-        if (planner_path.find("V0") != std::string::npos)
-        {
-          planner_config.version = 0;
-        }
-        else if (planner_path.find("V1") != std::string::npos)
-        {
-          planner_config.version = 1;
-        }
-        else if (planner_path.find("V2") != std::string::npos)
-        {
-          planner_config.version = 2;
-        }
-        else
-        {
-          std::cout << "Unsupported planner version: " << planner_path << std::endl;
-          throw std::runtime_error("Unsupported planner version: " + planner_path);
-        }
-        planner_ = std::make_unique<LocalMotionPlannerTensorRT>(planner_fp16, 0, planner_config);
-      }
-      
       // Initialize observation function map
       InitializeObservationFunctions();
       

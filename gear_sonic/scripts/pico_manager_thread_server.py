@@ -998,6 +998,27 @@ class ThreePointPose:
 
         return vr_3pt_pose
 
+    def process_vr3pt_pose(self, vr_3pt_pose_raw: np.ndarray) -> np.ndarray:
+        """Calibrate and return VR 3-point pose from a precomputed (3, 7) array."""
+        if self._calibration_pending:
+            self._capture_calibration(vr_3pt_pose_raw)
+        vr_3pt_pose = self._apply_calibration(vr_3pt_pose_raw)
+        if self.vr3pt_visualizer is not None:
+            self.vr3pt_visualizer.update_from_vr_pose(vr_3pt_pose, waist_scale=1.0)
+            self.vr3pt_visualizer.render()
+        return vr_3pt_pose
+
+    def calibrate_from_vr3pt(self, vr_3pt_pose_raw: np.ndarray) -> bool:
+        """Calibrate using a VR 3-point snapshot (Quest / controller-only path)."""
+        try:
+            self._override_robot_q = np.zeros(29, dtype=np.float64)
+            self._capture_calibration(vr_3pt_pose_raw)
+            print(f"[{self.log_prefix}] Calibration completed (Quest VR 3-point reference)")
+            return True
+        except Exception as e:
+            print(f"[{self.log_prefix}] Calibration failed: {e}")
+            return False
+
     def close(self) -> None:
         """Close and cleanup visualizer resources."""
         if self.vr3pt_visualizer is not None:
@@ -1570,23 +1591,26 @@ class FeedbackReader:
         # return robot_model.get_joint_group_indices("upper_body")
         return [12, 13, 14, 15, 22, 16, 23, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28]
 
-    def poll_feedback(self):
+    def poll_feedback(self, quiet: bool = False):
         """Poll for feedback once, and update internal state."""
         (
             self.upper_body_position_target,
             self.left_hand_position_target,
             self.right_hand_position_target,
             self.full_body_q_measured,
-        ) = self._process_upper_body_position_targets()
-        print("[PlannerLoop] Saved upper body position target:", self.upper_body_position_target)
+        ) = self._process_upper_body_position_targets(quiet=quiet)
+        if not quiet:
+            print("[PlannerLoop] Saved upper body position target:", self.upper_body_position_target)
 
     def _process_upper_body_position_targets(
         self,
+        quiet: bool = False,
     ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         data = self.poller.get_data()
 
         if data is None:
-            print("[PlannerLoop] No feedback data received")
+            if not quiet:
+                print("[PlannerLoop] No feedback data received")
             return None, None, None, None
 
         unpacked = msgpack.unpackb(data, raw=False)
@@ -1596,19 +1620,22 @@ class FeedbackReader:
             full_body_q = np.array(body_q_swizzled, dtype=np.float64)
             body_q = [body_q_swizzled[i] for i in self.upper_body_joint_indices]
         else:
-            print("[PlannerLoop] body_q_measured not in feedback data")
+            if not quiet:
+                print("[PlannerLoop] body_q_measured not in feedback data")
             body_q = None
 
         if "left_hand_q_measured" in unpacked:
             left_hand_q = unpacked["left_hand_q_measured"]
         else:
-            print("[PlannerLoop] left_hand_q_measured not in feedback data")
+            if not quiet:
+                print("[PlannerLoop] left_hand_q_measured not in feedback data")
             left_hand_q = None
 
         if "right_hand_q_measured" in unpacked:
             right_hand_q = unpacked["right_hand_q_measured"]
         else:
-            print("[PlannerLoop] right_hand_q_measured not in feedback data")
+            if not quiet:
+                print("[PlannerLoop] right_hand_q_measured not in feedback data")
             right_hand_q = None
 
         return body_q, left_hand_q, right_hand_q, full_body_q

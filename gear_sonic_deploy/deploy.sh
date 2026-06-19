@@ -28,6 +28,11 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+export TensorRT_ROOT="${TensorRT_ROOT:-$HOME/deps/TensorRT-10.13.3.9}"
+export CUDA_HOME="${CUDA_HOME:-$HOME/deps/cuda}"
+export onnxruntime_ROOT="${onnxruntime_ROOT:-$HOME/deps/onnxruntime}"
+export LD_LIBRARY_PATH="${TensorRT_ROOT}/lib:${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${onnxruntime_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+
 # ============================================================================
 # Interface Resolution Functions
 # ============================================================================
@@ -207,6 +212,7 @@ show_usage() {
     echo "  --cp, --checkpoint PATH Set the checkpoint path (default: policy/checkpoints/example/model_step_000000)"
     echo "  --obs-config PATH       Set the observation config file (default: policy/configs/example.yaml)"
     echo "  --planner PATH          Set the planner model path (default: planner/example.onnx)"
+    echo "  --no-planner            Run without locomotion planner (sim2sim reference motions)"
     echo "  --motion-data PATH      Set the motion data path (default: reference/example_motion/)"
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
@@ -282,6 +288,10 @@ while [[ $# -gt 0 ]]; do
             fi
             PLANNER="$2"
             shift 2
+            ;;
+        --no-planner)
+            PLANNER=""
+            shift
             ;;
         --motion-data)
             if [[ -z "$2" ]]; then
@@ -426,7 +436,11 @@ MISSING_FILES=0
 check_file "$CHECKPOINT_DECODER" || MISSING_FILES=$((MISSING_FILES + 1))
 check_file "$CHECKPOINT_ENCODER" || MISSING_FILES=$((MISSING_FILES + 1))
 check_file "$OBS_CONFIG" || MISSING_FILES=$((MISSING_FILES + 1))
-check_file "$PLANNER" || MISSING_FILES=$((MISSING_FILES + 1))
+if [[ -n "$PLANNER" ]]; then
+    check_file "$PLANNER" || MISSING_FILES=$((MISSING_FILES + 1))
+else
+    echo -e "${YELLOW}⚠️  Planner disabled (--no-planner)${NC}"
+fi
 
 if [ -d "$MOTION_DATA" ]; then
     echo -e "${GREEN}✅ Found: $MOTION_DATA${NC}"
@@ -491,6 +505,7 @@ set -e  # Re-enable exit on error
 
 # Always build to ensure we have the latest version
 echo "Building the project..."
+export CMAKE_PREFIX_PATH="${HOME}/deps/gtest:${HOME}/deps/zeromq:${CMAKE_PREFIX_PATH:-}"
 just build
 
 echo ""
@@ -511,7 +526,11 @@ echo -e "  Decoder Model:      ${GREEN}$CHECKPOINT_DECODER${NC}"
 echo -e "  Encoder Model:      ${GREEN}$CHECKPOINT_ENCODER${NC}"
 echo -e "  Motion Data:        ${GREEN}$MOTION_DATA${NC}"
 echo -e "  Obs Config:         ${GREEN}$OBS_CONFIG${NC}"
+if [[ -n "$PLANNER" ]]; then
 echo -e "  Planner:            ${GREEN}$PLANNER${NC}"
+else
+echo -e "  Planner:            ${YELLOW}disabled${NC}"
+fi
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
@@ -526,7 +545,9 @@ echo ""
 echo -e "${BLUE}just run g1_deploy_onnx_ref $TARGET $CHECKPOINT_DECODER $MOTION_DATA \\${NC}"
 echo -e "${BLUE}    --obs-config $OBS_CONFIG \\${NC}"
 echo -e "${BLUE}    --encoder-file $CHECKPOINT_ENCODER \\${NC}"
+if [[ -n "$PLANNER" ]]; then
 echo -e "${BLUE}    --planner-file $PLANNER \\${NC}"
+fi
 echo -e "${BLUE}    --input-type $INPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --output-type $OUTPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --zmq-host $ZMQ_HOST${NC}"
@@ -552,24 +573,21 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""
     
     # Build the command with optional extra args
-    if [[ -n "$EXTRA_ARGS" ]]; then
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
-            --input-type "$INPUT_TYPE" \
-            --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST" \
-            $EXTRA_ARGS
-    else
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
-            --input-type "$INPUT_TYPE" \
-            --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST"
+    DEPLOY_CMD=(
+        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA"
+        --obs-config "$OBS_CONFIG"
+        --encoder-file "$CHECKPOINT_ENCODER"
+        --input-type "$INPUT_TYPE"
+        --output-type "$OUTPUT_TYPE"
+        --zmq-host "$ZMQ_HOST"
+    )
+    if [[ -n "$PLANNER" ]]; then
+        DEPLOY_CMD+=(--planner-file "$PLANNER")
     fi
+    if [[ -n "$EXTRA_ARGS" ]]; then
+        DEPLOY_CMD+=($EXTRA_ARGS)
+    fi
+    "${DEPLOY_CMD[@]}"
 else
     echo ""
     echo -e "${YELLOW}Deployment cancelled.${NC}"

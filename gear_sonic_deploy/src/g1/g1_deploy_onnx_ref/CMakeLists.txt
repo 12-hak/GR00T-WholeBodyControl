@@ -101,7 +101,13 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
   # x86_64 platform - no DLA support needed
   # Dynamically find CUDA installation for x86_64
   if(DEFINED ENV{CUDAToolkit_ROOT})
-    set(CUDA_X64_LIB_PATH "$ENV{CUDAToolkit_ROOT}/lib64")
+    if(EXISTS "$ENV{CUDAToolkit_ROOT}/lib64")
+      set(CUDA_X64_LIB_PATH "$ENV{CUDAToolkit_ROOT}/lib64")
+    elseif(EXISTS "$ENV{CUDAToolkit_ROOT}/lib")
+      set(CUDA_X64_LIB_PATH "$ENV{CUDAToolkit_ROOT}/lib")
+    else()
+      set(CUDA_X64_LIB_PATH "/usr/local/cuda/lib64")
+    endif()
   elseif(EXISTS "/usr/local/cuda/lib64")
     set(CUDA_X64_LIB_PATH "/usr/local/cuda/lib64")
   else()
@@ -232,30 +238,43 @@ else()
   message(STATUS "ROS2 not found - building without ROS2InputHandler support")
 endif()
 
-# test executable:
-include(FetchContent)
+# test executable (prefer prebuilt GTest; FetchContent cache on WSL home, not /mnt/d)
+list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/deps/gtest")
+find_package(GTest QUIET)
 
-# Download and make GoogleTest available
-FetchContent_Declare(
-  googletest
-  URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
-)
-FetchContent_MakeAvailable(googletest)
+if(NOT GTest_FOUND)
+  if(DEFINED ENV{HOME} AND NOT "$ENV{HOME}" STREQUAL "")
+    set(_gtest_fetch_base "$ENV{HOME}/.cache/cmake_fetchcontent")
+  else()
+    set(_gtest_fetch_base "${CMAKE_BINARY_DIR}/_deps")
+  endif()
+  set(FETCHCONTENT_BASE_DIR "${_gtest_fetch_base}" CACHE PATH "" FORCE)
+  file(MAKE_DIRECTORY "${_gtest_fetch_base}")
 
-find_package(GTest REQUIRED)
+  include(FetchContent)
+  FetchContent_Declare(
+    googletest
+    URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+  )
+  FetchContent_MakeAvailable(googletest)
+  find_package(GTest QUIET)
+endif()
 
-file(GLOB_RECURSE TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/*.cpp)
+if(GTest_FOUND)
+  file(GLOB_RECURSE TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/*.cpp)
 
-add_executable(run_tests ${TEST_SRCS})
-target_link_directories(run_tests PRIVATE ${CUDA_LINK_DIRS})
-target_link_libraries(run_tests GTest::GTest GTest::Main ${EXE_LIBS})
-target_include_directories(run_tests PUBLIC ${EXE_INCLUDES})
+  add_executable(run_tests ${TEST_SRCS})
+  target_link_directories(run_tests PRIVATE ${CUDA_LINK_DIRS})
+  target_link_libraries(run_tests GTest::GTest GTest::Main ${EXE_LIBS})
+  target_include_directories(run_tests PUBLIC ${EXE_INCLUDES})
 
-# Setting our output directory and C++ standard
-set_target_properties(
-  run_tests
-  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
-             OUTPUT_NAME run_tests
-             CXX_STANDARD 20
-             CXX_STANDARD_REQUIRED ON
-             CXX_EXTENSIONS OFF)
+  set_target_properties(
+    run_tests
+    PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+               OUTPUT_NAME run_tests
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CXX_EXTENSIONS OFF)
+else()
+  message(STATUS "GTest not available - skipping unit tests")
+endif()

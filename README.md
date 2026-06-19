@@ -81,6 +81,8 @@ In this repo, we release SONIC's training code, deployment framework, model chec
 
 SONIC supports real-time whole-body teleoperation via PICO VR headset, enabling natural human-to-robot motion transfer for data collection and interactive control.
 
+**Quest 3 (experimental, sim2sim on Windows + WSL):** see [docs/quest3_teleop.md](docs/quest3_teleop.md) for WebXR arm teleop setup, calibration, and GitHub publish steps.
+
 <div align="center">
 <table>
 <tr>

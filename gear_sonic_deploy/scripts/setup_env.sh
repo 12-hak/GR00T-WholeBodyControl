@@ -212,6 +212,14 @@ echo "🔧 Setting up CUDA environment..."
 
 # Function to detect and set CUDA toolkit root
 setup_cuda_toolkit() {
+    if [ -n "$CUDA_HOME" ] && [ -d "$CUDA_HOME" ]; then
+        export CUDAToolkit_ROOT="$CUDA_HOME"
+        export PATH="$CUDA_HOME/bin:$PATH"
+        export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
+        echo "✅ CUDA toolkit: using pre-set CUDA_HOME=$CUDA_HOME"
+        return 0
+    fi
+
     # Check if CUDAToolkit_ROOT is already set
     if [ -n "$CUDAToolkit_ROOT" ] && [ -f "$CUDAToolkit_ROOT/bin/nvcc" ]; then
         echo "✅ CUDA toolkit found: CUDAToolkit_ROOT already set to $CUDAToolkit_ROOT"

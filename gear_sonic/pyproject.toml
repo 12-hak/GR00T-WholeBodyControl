@@ -36,6 +36,7 @@ teleop = [
     "pyzmq",
     "msgpack",
     "pin",
+    "websockets",
     "pyvista; platform_machine != 'aarch64'",
 ]
 # MuJoCo simulation (run_sim_loop.py and related scripts)

@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>GR00T Quest Arm Teleop</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+  <style>
+    html, body { margin: 0; background: #000; }
+    #hud {
+      position: fixed; z-index: 9999; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.75); color: #eee; padding: 12px 16px;
+      font-size: 14px; line-height: 1.4; pointer-events: none;
+    }
+    #hud button {
+      pointer-events: auto; font-size: 16px; padding: 10px 18px;
+      background: #2d6cdf; color: #fff; border: none; border-radius: 8px;
+      margin-right: 8px;
+    }
+    a-scene { background: transparent !important; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <button id="enterAr">Passthrough</button>
+    <button id="enterVr">VR room</button>
+    <span id="status"> Loading…</span>
+    <pre id="stats"></pre>
+  </div>
+
+  <a-scene
+    id="scene"
+    webxr="referenceSpaceType: local"
+    ar-mode-ui="enabled: true"
+    vr-mode-ui="enabled: false"
+    renderer="alpha: true; colorManagement: true; antialias: true"
+    background="color: #000000"
+    ar-passthrough-fix
+    teleop-streamer
+  >
+    <!-- Hidden until VR room mode — keeps passthrough clear -->
+    <a-entity id="virtEnv" visible="false">
+      <a-sky color="#1a1a3a"></a-sky>
+      <a-plane rotation="-90 0 0" width="20" height="20" color="#2a2a5a" opacity="0.9"></a-plane>
+      <a-grid material="color: #445; opacity: 0.35" position="0 0.01 0" width="20" height="20"></a-grid>
+      <a-text value="GR00T Quest Teleop" position="0 2.2 -3" align="center" color="#aaf"></a-text>
+    </a-entity>
+
+    <a-entity id="cameraRig">
+      <a-entity id="hmd" camera position="0 0 0"></a-entity>
+    </a-entity>
+
+    <a-entity id="leftHand" oculus-touch-controls="hand: left"></a-entity>
+    <a-entity id="rightHand" oculus-touch-controls="hand: right"></a-entity>
+  </a-scene>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const wsHost = params.get("host") || location.hostname;
+    const wsPort = params.get("port") || location.port || "8766";
+    const wsUrl = `wss://${wsHost}:${wsPort}`;
+
+    const statusEl = document.getElementById("status");
+    const statsEl = document.getElementById("stats");
+    const scene = document.getElementById("scene");
+    const virtEnv = document.getElementById("virtEnv");
+
+    let ws = null;
+    let sentCount = 0;
+    let tickCount = 0;
+
+    function isXrActive() {
+      return scene.is("ar-mode") || scene.is("vr-mode");
+    }
+
+    function setStatus(msg, ok) {
+      statusEl.textContent = " " + msg;
+      statusEl.className = ok === true ? "ok" : (ok === false ? "bad" : "");
+    }
+
+    function setPassthroughClear() {
+      if (scene.renderer) scene.renderer.setClearColor(0, 0, 0, 0);
+      scene.setAttribute("background", "transparent: true");
+      virtEnv.setAttribute("visible", "false");
+    }
+
+    function setVrRoomVisible() {
+      virtEnv.setAttribute("visible", "true");
+      scene.setAttribute("background", "color: #1a1a3a");
+      if (scene.renderer) scene.renderer.setClearColor(0x1a1a3a, 1);
+    }
+
+    function connectWs() {
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+      ws = new WebSocket(wsUrl);
+      ws.onopen = () => setStatus("WebSocket OK — tap Passthrough", true);
+      ws.onerror = () => setStatus("WebSocket FAILED", false);
+      ws.onclose = () => setTimeout(connectWs, 2000);
+    }
+    connectWs();
+
+    setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN || isXrActive()) return;
+      ws.send(JSON.stringify({
+        ping: true, t: Date.now() / 1000, in_vr: false,
+        dbg: { tickCount, sentCount, engine: "aframe" },
+      }));
+    }, 1000);
+
+    scene.addEventListener("loaded", () => setPassthroughClear());
+
+    scene.addEventListener("enter-ar", () => {
+      connectWs();
+      setPassthroughClear();
+      setStatus("Passthrough — streaming", true);
+      document.getElementById("enterAr").style.display = "none";
+      document.getElementById("enterVr").style.display = "none";
+    });
+
+    scene.addEventListener("exit-ar", () => {
+      setStatus("Exited — tap Passthrough", false);
+      document.getElementById("enterAr").style.display = "inline-block";
+      document.getElementById("enterVr").style.display = "inline-block";
+    });
+
+    scene.addEventListener("enter-vr", () => {
+      connectWs();
+      setVrRoomVisible();
+      setStatus("VR room — streaming", true);
+      document.getElementById("enterAr").style.display = "none";
+      document.getElementById("enterVr").style.display = "none";
+    });
+
+    scene.addEventListener("exit-vr", () => {
+      setPassthroughClear();
+      setStatus("Exited — tap Passthrough", false);
+      document.getElementById("enterAr").style.display = "inline-block";
+      document.getElementById("enterVr").style.display = "inline-block";
+    });
+
+    AFRAME.registerComponent("ar-passthrough-fix", {
+      tick: function () {
+        if (!this.el.is("ar-mode")) return;
+        setPassthroughClear();
+      },
+    });
+
+    function elPose(el) {
+      if (!el || !el.object3D) return null;
+      const p = new THREE.Vector3();
+      const q = new THREE.Quaternion();
+      el.object3D.getWorldPosition(p);
+      el.object3D.getWorldQuaternion(q);
+      return [p.x, p.y, p.z, q.x, q.y, q.z, q.w];
+    }
+
+    function offsetFrom(hmd, x, y, z) {
+      return [hmd[0] + x, hmd[1] + y, hmd[2] + z, hmd[3], hmd[4], hmd[5], hmd[6]];
+    }
+
+    function readButtons(hand) {
+      const gc = hand && hand.components && hand.components["oculus-touch-controls"];
+      const gp = gc && gc.controller && gc.controller.gamepad;
+      if (!gp) return { trigger: 0, stickClick: false, a: false, x: false };
+      return {
+        trigger: gp.buttons[0]?.value || 0,
+        stickClick: gp.buttons[3]?.pressed || gp.buttons[4]?.pressed || false,
+        a: gp.buttons[4]?.pressed || gp.buttons[5]?.pressed || false,
+        x: gp.buttons[2]?.pressed || gp.buttons[3]?.pressed || false,
+      };
+    }
+
+    function applyStickDeadzone(x, y, dead = 0.08) {
+      const mag = Math.hypot(x, y);
+      if (mag < dead) return [0, 0];
+      const s = (mag - dead) / (1 - dead) / mag;
+      return [x * s, y * s];
+    }
+
+    function pickStickPair(ax) {
+      let best = [0, 0];
+      let bestMag = 0;
+      for (const [i, j] of [[0, 1], [2, 3]]) {
+        if (ax.length <= j) continue;
+        const m = Math.hypot(ax[i], ax[j]);
+        if (m > bestMag) {
+          bestMag = m;
+          best = [ax[i], ax[j]];
+        }
+      }
+      return applyStickDeadzone(best[0], best[1]);
+    }
+
+    function readThumbsticks(renderer) {
+      const out = { left: [0, 0], right: [0, 0], src: "none", raw: {} };
+      const pads = navigator.getGamepads ? Array.from(navigator.getGamepads()) : [];
+      const session = renderer && renderer.xr && renderer.xr.getSession();
+
+      if (session) {
+        for (const source of session.inputSources) {
+          if (!source.handedness || source.handedness === "none") continue;
+          const key = source.handedness;
+          let gp = source.gamepad;
+          if (gp && gp.index != null && pads[gp.index]) {
+            gp = pads[gp.index];
+          }
+          if (!gp || !gp.axes) continue;
+          out[key] = pickStickPair(gp.axes);
+          out.raw[key] = Array.from(gp.axes);
+          out.src = "webxr";
+        }
+      }
+
+      if (out.src === "none") {
+        for (const gp of pads) {
+          if (!gp || !gp.axes) continue;
+          const id = (gp.id || "").toLowerCase();
+          let key = null;
+          if (id.includes("left")) key = "left";
+          if (id.includes("right")) key = "right";
+          if (!key) continue;
+          out[key] = pickStickPair(gp.axes);
+          out.raw[key] = Array.from(gp.axes);
+          out.src = "gamepads";
+        }
+      }
+
+      if (out.src === "none") {
+        const leftEl = document.getElementById("leftHand");
+        const rightEl = document.getElementById("rightHand");
+        const lgc = leftEl && leftEl.components && leftEl.components["oculus-touch-controls"];
+        const rgc = rightEl && rightEl.components && rightEl.components["oculus-touch-controls"];
+        const lgp = lgc && lgc.controller && lgc.controller.gamepad;
+        const rgp = rgc && rgc.controller && rgc.controller.gamepad;
+        if (lgp) {
+          out.left = pickStickPair(lgp.axes);
+          out.raw.left = Array.from(lgp.axes);
+        }
+        if (rgp) {
+          out.right = pickStickPair(rgp.axes);
+          out.raw.right = Array.from(rgp.axes);
+        }
+        if (lgp || rgp) out.src = "aframe";
+      }
+      return out;
+    }
+
+    AFRAME.registerComponent("teleop-streamer", {
+      tick: function () {
+        tickCount++;
+        if (!isXrActive() || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+        const hmd = elPose(document.getElementById("hmd"));
+        if (!hmd) return;
+
+        const leftEl = document.getElementById("leftHand");
+        const rightEl = document.getElementById("rightHand");
+        let left = elPose(leftEl);
+        let right = elPose(rightEl);
+        if (!left) left = offsetFrom(hmd, -0.25, -0.15, 0.05);
+        if (!right) right = offsetFrom(hmd, 0.25, -0.15, 0.05);
+
+        const lb = readButtons(leftEl);
+        const rb = readButtons(rightEl);
+        const ar = scene.is("ar-mode");
+        const sticks = readThumbsticks(scene.renderer);
+
+        ws.send(JSON.stringify({
+          t: Date.now() / 1000,
+          hmd, left, right,
+          buttons: {
+            left_stick_click: lb.stickClick,
+            right_a: rb.a,
+            right_x: rb.x,
+            stop_combo: (rb.a && rb.x) || (lb.a && lb.x),
+            left_trigger: lb.trigger,
+            right_trigger: rb.trigger,
+          },
+          thumbstick: { left: sticks.left, right: sticks.right },
+          dbg: {
+            tickCount, sentCount, in_vr: true, ar_mode: ar, passthrough: ar,
+            stick_src: sticks.src,
+            sticks: sticks,
+          },
+        }));
+        sentCount++;
+
+        if (sentCount % 20 === 0) {
+          statsEl.textContent =
+            `sent: ${sentCount}\nticks: ${tickCount}\n` +
+            `sticks (${sticks.src}): L[${sticks.left.map(v => v.toFixed(2))}] ` +
+            `R[${sticks.right.map(v => v.toFixed(2))}]\n` +
+            (sticks.raw.right ? `R raw: ${sticks.raw.right.map(v => v.toFixed(2))}\n` : "") +
+            (ar ? "passthrough: on" : "vr room");
+        }
+      },
+    });
+
+    document.getElementById("enterAr").addEventListener("click", () => {
+      if (isXrActive()) return;
+      setPassthroughClear();
+      scene.enterAR().catch((e) => setStatus("Passthrough failed: " + e.message, false));
+    });
+
+    document.getElementById("enterVr").addEventListener("click", () => {
+      if (isXrActive()) return;
+      setVrRoomVisible();
+      scene.enterVR().catch((e) => setStatus("VR failed: " + e.message, false));
+    });
+  </script>
+</body>
+</html>
