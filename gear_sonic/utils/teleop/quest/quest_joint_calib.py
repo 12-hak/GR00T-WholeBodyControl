@@ -92,20 +92,19 @@ _CALIB_STEPS: list[_CalibStepDef] = [
 
 
 class QuestJointCalibWizard:
-    COUNTDOWN_SEC = 3.0
+    # Capture window once you trigger a step. The wizard now WAITS for you to
+    # press a key (SPACE/ENTER) before each capture, so it never feels rushed.
     CAPTURE_SEC = 0.6
 
     def __init__(self) -> None:
         self.offsets = QuestJointOffsets()
         self._step_idx = 0
-        self._phase = "idle"
-        self._countdown_at = 0.0
+        self._phase = "idle"  # idle | wait | capture
         self._capture_at = 0.0
         self._capture_buf: list[np.ndarray] = []
         self._left_samples: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._right_samples: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._neck_samples: dict[str, np.ndarray] = {}
-        self._announced = -1
 
     @property
     def running(self) -> bool:
@@ -113,20 +112,36 @@ class QuestJointCalibWizard:
 
     def start(self) -> None:
         self._step_idx = 0
-        self._phase = "countdown"
-        self._countdown_at = 0.0
+        self._phase = "wait"
         self._capture_buf.clear()
         self._left_samples.clear()
         self._right_samples.clear()
         self._neck_samples.clear()
-        self._announced = -1
         self.offsets = QuestJointOffsets()
         print("\n[Quest] === Joint calibration (j) ===")
+        print("[Quest] Hold each pose, then press SPACE/ENTER to capture it. (k to abort)")
         self._print_step_prompt()
+
+    def abort(self) -> None:
+        if self._phase != "idle":
+            self._phase = "idle"
+            print("[Quest] Joint calibration aborted — previous calibration kept.")
+
+    def request_capture(self) -> None:
+        """Called when the operator presses the capture key. Begins a short capture."""
+        if self._phase == "wait":
+            self._phase = "capture"
+            self._capture_at = 0.0
+            self._capture_buf.clear()
+            step = _CALIB_STEPS[self._step_idx]
+            print(f"[Quest] Capturing '{step.key}'… hold still")
 
     def _print_step_prompt(self) -> None:
         step = _CALIB_STEPS[self._step_idx]
-        print(f"[Quest] Step {self._step_idx + 1}/{len(_CALIB_STEPS)}: {step.prompt}")
+        print(
+            f"\n[Quest] Step {self._step_idx + 1}/{len(_CALIB_STEPS)}: {step.prompt}"
+            "\n[Quest]   -> get into the pose, then press SPACE/ENTER"
+        )
 
     def _avg_pose(self, buf: list[np.ndarray]) -> np.ndarray:
         arr = np.stack(buf, axis=0)
@@ -197,40 +212,22 @@ class QuestJointCalibWizard:
         )
 
     def tick(self, now: float, raw_vr_3pt: np.ndarray | None) -> None:
-        if self._phase == "idle":
-            return
-        if raw_vr_3pt is None:
+        if self._phase != "capture" or raw_vr_3pt is None:
             return
 
-        if self._phase == "countdown":
-            if self._countdown_at <= 0.0:
-                self._countdown_at = now + self.COUNTDOWN_SEC
-            remaining = int(np.ceil(self._countdown_at - now))
-            if remaining != self._announced:
-                self._announced = remaining
-                if remaining > 0:
-                    print(f"[Quest] Hold pose… {remaining}")
-            if now >= self._countdown_at:
-                self._phase = "capture"
-                self._capture_at = now + self.CAPTURE_SEC
-                self._capture_buf.clear()
-                self._announced = -1
-            return
-
-        if self._phase == "capture":
-            self._capture_buf.append(raw_vr_3pt.copy())
-            if now >= self._capture_at:
-                if self._capture_buf:
-                    self._finish_capture(self._avg_pose(self._capture_buf))
-                self._step_idx += 1
-                if self._step_idx >= len(_CALIB_STEPS):
-                    self._phase = "idle"
-                    self._finalize()
-                else:
-                    self._phase = "countdown"
-                    self._countdown_at = 0.0
-                    self._print_step_prompt()
-            return
+        if self._capture_at <= 0.0:
+            self._capture_at = now + self.CAPTURE_SEC
+        self._capture_buf.append(raw_vr_3pt.copy())
+        if now >= self._capture_at:
+            if self._capture_buf:
+                self._finish_capture(self._avg_pose(self._capture_buf))
+            self._step_idx += 1
+            if self._step_idx >= len(_CALIB_STEPS):
+                self._phase = "idle"
+                self._finalize()
+            else:
+                self._phase = "wait"
+                self._print_step_prompt()
 
 
 def compute_waist_from_neck_quat(

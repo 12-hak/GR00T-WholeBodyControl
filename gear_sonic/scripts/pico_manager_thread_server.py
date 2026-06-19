@@ -1008,14 +1008,20 @@ class ThreePointPose:
             self.vr3pt_visualizer.render()
         return vr_3pt_pose
 
-    def calibrate_from_vr3pt(self, vr_3pt_pose_raw: np.ndarray) -> bool:
+    def calibrate_from_vr3pt(
+        self, vr_3pt_pose_raw: np.ndarray, *, full_reset: bool = True
+    ) -> bool:
         """Calibrate using a VR 3-point snapshot (Quest / controller-only path)."""
         try:
+            if full_reset:
+                self._clear_calibration()
+            self._calibration_pending = False
             self._override_robot_q = np.zeros(29, dtype=np.float64)
             self._capture_calibration(vr_3pt_pose_raw)
             print(f"[{self.log_prefix}] Calibration completed (Quest VR 3-point reference)")
             return True
         except Exception as e:
+            self._calibration_pending = False
             print(f"[{self.log_prefix}] Calibration failed: {e}")
             return False
 

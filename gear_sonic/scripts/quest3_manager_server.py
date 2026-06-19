@@ -30,14 +30,14 @@ from pathlib import Path
 import msgpack
 import numpy as np
 import zmq
+from scipy.spatial.transform import Rotation as sRot
 
-from gear_sonic.utils.teleop.quest.quest_joint_calib import (
-    QuestJointCalibWizard,
-    build_upper_body_with_waist,
-)
+from gear_sonic.utils.teleop.quest.quest_joint_calib import QuestJointCalibWizard, QuestJointOffsets
 from gear_sonic.utils.teleop.quest.quest_pose import (
+    DEFAULT_ARM_REACH_SCALE,
     QuestLocomotion,
-    estimate_torso_yaw_rad,
+    apply_quest_vr3pt_axis_fix,
+    hmd_yaw_rad,
     quest_poses_to_vr3pt_raw,
     webxr_to_unity_pose7,
 )
@@ -280,6 +280,14 @@ def _keyboard_listener(state: dict) -> None:
                     state["cmd"] = "planner"
                 elif ch == "j":
                     state["cmd"] = "joint_calib"
+                elif ch in (" ", "\r", "\n"):
+                    state["cmd"] = "calib_capture"
+                elif ch == "k":
+                    state["cmd"] = "calib_abort"
+                elif ch == "d":
+                    state["cmd"] = "debug_toggle"
+                elif ch == "f":
+                    state["cmd"] = "freeze_orient_toggle"
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
@@ -294,6 +302,12 @@ def main() -> None:
     parser.add_argument("--host-ip", type=str, default=os.environ.get("QUEST_HOST_IP", "192.168.1.235"))
     parser.add_argument("--cert-dir", type=str, default=os.path.expanduser("~/.gear_sonic_quest_certs"))
     parser.add_argument("--vis", action="store_true", help="VR 3-point PyVista debug view")
+    parser.add_argument(
+        "--arm-scale",
+        type=float,
+        default=DEFAULT_ARM_REACH_SCALE,
+        help="Scale wrist reach from calibration pose (default: %(default)s)",
+    )
     args = parser.parse_args()
 
     cert_path, key_path = ensure_tls_cert(Path(args.cert_dir), args.host_ip)
@@ -307,16 +321,48 @@ def main() -> None:
 
     def _freeze_torso(frame: QuestFrame) -> None:
         nonlocal frozen_torso_yaw
-        left_u = webxr_to_unity_pose7(frame.left)
-        right_u = webxr_to_unity_pose7(frame.right)
-        frozen_torso_yaw = estimate_torso_yaw_rad(left_u, right_u)
-        locomotion.sync_from_controllers(frame.left, frame.right)
+        hmd_u = webxr_to_unity_pose7(frame.hmd)
+        frozen_torso_yaw = hmd_yaw_rad(hmd_u)
+        locomotion.sync_from_hmd(frame.hmd)
         print(f"[Quest] Torso frame frozen (yaw={np.degrees(frozen_torso_yaw):.1f}°)")
 
     def _raw_pose(frame: QuestFrame) -> np.ndarray:
         return quest_poses_to_vr3pt_raw(
             frame.hmd, frame.left, frame.right, frozen_torso_yaw=frozen_torso_yaw
         )
+
+    def _recapture_wrist_ref() -> None:
+        """Re-learn wrist position/orientation reference without FK recalibration."""
+        keep_freeze = wrist_ref.get("freeze", True)
+        wrist_ref.clear()
+        wrist_ref.update(active=False, capture=True, freeze=keep_freeze)
+
+    def _enable_arm_tracking() -> None:
+        nonlocal mode
+        mode = StreamMode.PLANNER_VR_3PT
+        socket.send(build_command_message(start=True, stop=False, planner=True))
+        _recapture_wrist_ref()
+
+    def _recalibrate_quest(frame: QuestFrame, *, start_tracking: bool = True) -> bool:
+        """Full reset: torso frame, FK offsets (default robot pose), wrist tracking."""
+        _freeze_torso(frame)
+        raw = _raw_pose(frame)
+        if not three_point.calibrate_from_vr3pt(raw, full_reset=True):
+            print("[Quest] Calibration FAILED — check robot model / URDF loaded")
+            return False
+        joint_wizard.offsets = QuestJointOffsets()
+        if joint_wizard.running:
+            joint_wizard.abort()
+        if start_tracking:
+            _enable_arm_tracking()
+            print("[Quest] Calibrated — arms tracking (forearms-forward neutral)")
+        else:
+            _recapture_wrist_ref()
+            print("[Quest] Calibrated to default arm pose")
+        return True
+
+    # Position-first wrist tracking; press f to toggle live wrist rotation.
+    wrist_ref: dict = {"active": False, "capture": False, "freeze": True}
     feedback = FeedbackReader(zmq_feedback_port=args.zmq_feedback_port)
 
     ctx = zmq.Context()
@@ -338,10 +384,10 @@ def main() -> None:
     threading.Thread(target=_keyboard_listener, args=(kb_state,), daemon=True).start()
 
     print(
-        "\n[Quest] Keyboard: c=quick calib | j=joint calib wizard | s=start | v=arms | p=idle | o=stop\n"
-        "[Quest] j = move each arm horizontal/forward/up/back/down + head look poses.\n"
-        "[Quest] Sticks: left=move/strafe, right X=turn. Head=upper body; arms=controllers.\n"
-        "[Quest] Recalibrate (c) after changes. Torso frame locks at calibration.\n"
+        "\n[Quest] Keyboard: c=calibrate+track arms | s=start | v=arms | p=idle | o=stop\n"
+        "[Quest] Calibrate (c): forearms forward, elbows bent ~90°, look straight ahead.\n"
+        "[Quest] f=toggle wrist rotation (default: position-only). d=axis debug.\n"
+        "[Quest] Sticks: left=move/strafe, right X=turn.\n"
         "[Quest] Deploy must use: ./deploy.sh --input-type zmq_manager sim\n"
     )
 
@@ -353,6 +399,8 @@ def main() -> None:
     calibrate_at: float | None = None
     calibrate_announced = 0
     last_feedback_poll = 0.0
+    debug_axes = False
+    last_debug = 0.0
 
     try:
         while True:
@@ -364,12 +412,10 @@ def main() -> None:
             if cmd == "calibrate":
                 calibrate_at = now + 3.0
                 calibrate_announced = 0
-                print("[Quest] Calibration in 3s — stand tall, arms out (T-pose)")
+                print("[Quest] Calibration in 3s — forearms forward, elbows bent, look ahead")
             elif cmd == "start":
                 if frame is not None:
-                    _freeze_torso(frame)
-                    raw = _raw_pose(frame)
-                    three_point.calibrate_from_vr3pt(raw)
+                    _recalibrate_quest(frame, start_tracking=False)
                 else:
                     print("[Quest] No headset data yet — starting policy without VR calibration")
                 mode = StreamMode.PLANNER
@@ -381,14 +427,14 @@ def main() -> None:
                         "[Quest] Arm VR_3PT requested but no Quest data — "
                         "fix WebSocket on headset first, then press v again"
                     )
-                feedback.poll_feedback(quiet=True)
-                if feedback.full_body_q_measured is not None:
-                    three_point.reset_with_measured_q(feedback.full_body_q_measured)
+                elif not three_point.is_calibrated:
+                    if frame is not None:
+                        _recalibrate_quest(frame, start_tracking=True)
+                    else:
+                        print("[Quest] Press c to calibrate first")
                 else:
-                    three_point.reset_with_measured_q(np.zeros(29, dtype=np.float64))
-                mode = StreamMode.PLANNER_VR_3PT
-                socket.send(build_command_message(start=True, stop=False, planner=True))
-                print("[Quest] Arm VR_3PT mode active")
+                    _enable_arm_tracking()
+                    print("[Quest] Arm VR_3PT mode active")
             elif cmd == "planner":
                 mode = StreamMode.PLANNER
                 socket.send(build_command_message(start=True, stop=False, planner=True))
@@ -399,6 +445,24 @@ def main() -> None:
                 else:
                     _freeze_torso(frame)
                     joint_wizard.start()
+            elif cmd == "calib_capture":
+                if joint_wizard.running:
+                    joint_wizard.request_capture()
+            elif cmd == "calib_abort":
+                joint_wizard.abort()
+            elif cmd == "debug_toggle":
+                debug_axes = not debug_axes
+                wrist_ref["dbg_ref_L"] = None
+                wrist_ref["dbg_ref_R"] = None
+                print(
+                    f"[Quest] Axis debug {'ON' if debug_axes else 'OFF'} — "
+                    "hold still, then move ONE axis; read 'dominant'"
+                )
+            elif cmd == "freeze_orient_toggle":
+                wrist_ref["freeze"] = not wrist_ref.get("freeze", False)
+                print(
+                    f"[Quest] Wrist orientation {'FROZEN (position-only)' if wrist_ref.get('freeze') else 'LIVE'}"
+                )
             elif cmd == "stop":
                 mode = StreamMode.OFF
                 socket.send(build_command_message(start=False, stop=True, planner=True))
@@ -411,10 +475,8 @@ def main() -> None:
                         calibrate_announced = remaining
                         print(f"[Quest] Calibrating in {remaining}...")
                 elif frame is not None:
-                    _freeze_torso(frame)
-                    raw = _raw_pose(frame)
-                    three_point.calibrate_from_vr3pt(raw)
-                    print("[Quest] Calibrated — press v for arm tracking")
+                    if _recalibrate_quest(frame, start_tracking=True):
+                        print("[Quest] Ready — move arms")
                     calibrate_at = None
                 else:
                     print("[Quest] Calibration failed — no Quest pose data")
@@ -430,14 +492,11 @@ def main() -> None:
                     socket.send(build_command_message(start=False, stop=True, planner=True))
                     print("[Quest] Emergency stop (Quest buttons)")
                 elif stick_click and not prev_stick_click and mode == StreamMode.PLANNER:
-                    feedback.poll_feedback(quiet=True)
-                    q = feedback.full_body_q_measured
-                    three_point.reset_with_measured_q(
-                        q if q is not None else np.zeros(29, dtype=np.float64)
-                    )
-                    mode = StreamMode.PLANNER_VR_3PT
-                    socket.send(build_command_message(start=True, stop=False, planner=True))
-                    print("[Quest] Arm VR_3PT (left stick click)")
+                    if frame is not None and (
+                        three_point.is_calibrated or _recalibrate_quest(frame, start_tracking=True)
+                    ):
+                        _enable_arm_tracking()
+                        print("[Quest] Arm VR_3PT (left stick click)")
 
                 prev_stick_click = stick_click
                 prev_stop = stop_combo
@@ -446,27 +505,80 @@ def main() -> None:
                 raw_for_wizard = _raw_pose(frame)
                 joint_wizard.tick(now, raw_for_wizard)
                 if not joint_wizard.running and joint_wizard.offsets.active:
-                    three_point.reset()
-                    three_point.calibrate_from_vr3pt(joint_wizard.offsets.apply(raw_for_wizard))
+                    _freeze_torso(frame)
+                    three_point.calibrate_from_vr3pt(
+                        joint_wizard.offsets.apply(_raw_pose(frame)),
+                        full_reset=True,
+                    )
+                    _enable_arm_tracking()
                     print("[Quest] FK recalibrated after joint wizard")
 
+            # VR 3-point arm target — same fields Pico sends in VR_3PT mode.
             vr_pos = None
             vr_orn = None
-            upper_body_position = None
             if mode == StreamMode.PLANNER_VR_3PT and frame is not None:
                 raw = _raw_pose(frame)
                 raw = joint_wizard.offsets.apply(raw)
                 calibrated = three_point.process_vr3pt_pose(raw)
+
+                cl = sRot.from_quat(raw[0, 3:7], scalar_first=True)
+                cr = sRot.from_quat(raw[1, 3:7], scalar_first=True)
+                on_capture = bool(wrist_ref.get("capture") and three_point.is_calibrated)
+
+                if wrist_ref.get("active") and not on_capture and "r0_l" in wrist_ref:
+                    if wrist_ref.get("freeze"):
+                        wl = wrist_ref["r0_l"]
+                        wr = wrist_ref["r0_r"]
+                    else:
+                        wl = (cl * wrist_ref["c0_l"].inv()) * wrist_ref["r0_l"]
+                        wr = (cr * wrist_ref["c0_r"].inv()) * wrist_ref["r0_r"]
+                    calibrated[0, 3:7] = wl.as_quat(scalar_first=True)
+                    calibrated[1, 3:7] = wr.as_quat(scalar_first=True)
+
+                reach_origin = (
+                    wrist_ref.get("p0")
+                    if wrist_ref.get("active") and not on_capture
+                    else None
+                )
+                reach_scale = args.arm_scale if reach_origin is not None else 1.0
+                calibrated = apply_quest_vr3pt_axis_fix(
+                    calibrated, reach_scale=reach_scale, reach_origin=reach_origin
+                )
+
+                if on_capture or (
+                    wrist_ref.get("active") and wrist_ref.get("p0") is None
+                ):
+                    wrist_ref["r0_l"] = sRot.from_quat(calibrated[0, 3:7], scalar_first=True)
+                    wrist_ref["r0_r"] = sRot.from_quat(calibrated[1, 3:7], scalar_first=True)
+                    wrist_ref["p0"] = calibrated[:2, :3].copy()
+
+                if on_capture:
+                    wrist_ref["c0_l"] = cl
+                    wrist_ref["c0_r"] = cr
+                    wrist_ref["active"] = True
+                    wrist_ref["capture"] = False
+                    print("[Quest] Wrist reference captured — tracking from neutral pose")
+
                 vr_pos = calibrated[:, :3].flatten().tolist()
                 vr_orn = calibrated[:, 3:].flatten().tolist()
-                feedback.poll_feedback(quiet=True)
-                neck_q = np.array(calibrated[2, 3:7], dtype=np.float64)
-                gain = joint_wizard.offsets.neck_pitch_gain if joint_wizard.offsets.active else 1.8
-                upper_body_position = build_upper_body_with_waist(
-                    feedback.upper_body_position_target,
-                    neck_q,
-                    pitch_gain=gain,
-                )
+
+                if debug_axes and now - last_debug > 0.4:
+                    last_debug = now
+                    for hand, idx in (("L", 0), ("R", 1)):
+                        pos = np.array(calibrated[idx, :3], dtype=np.float64)
+                        key = f"dbg_ref_{hand}"
+                        ref = wrist_ref.get(key)
+                        if ref is None:
+                            wrist_ref[key] = pos.copy()
+                            ref = pos
+                        d = pos - ref
+                        labels = ["X(fwd)", "Y(left)", "Z(up)"]
+                        i = int(np.argmax(np.abs(d)))
+                        dom = f"{'+' if d[i] >= 0 else '-'}{labels[i]}"
+                        print(
+                            f"[dbg] {hand} pos=[{pos[0]:+.2f},{pos[1]:+.2f},{pos[2]:+.2f}] "
+                            f"dFromRef=[{d[0]:+.2f},{d[1]:+.2f},{d[2]:+.2f}] dominant={dom}"
+                        )
 
             if mode in (StreamMode.PLANNER, StreamMode.PLANNER_VR_3PT):
                 if frame is not None:
@@ -494,7 +606,6 @@ def main() -> None:
                         height=-1.0,
                         vr_3pt_position=vr_pos,
                         vr_3pt_orientation=vr_orn,
-                        upper_body_position=upper_body_position,
                     )
                 )
 
