@@ -74,6 +74,7 @@
 #include <unitree/idl/hg/IMUState_.hpp>
 #include <unitree/idl/hg/LowCmd_.hpp>
 #include <unitree/idl/hg/LowState_.hpp>
+#include <unitree/idl/go2/WirelessController_.hpp>
 #include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
 
 // TRTInference
@@ -267,10 +268,12 @@ class G1Deploy {
     DataBuffer<IMUState_> imu_torso_buffer_;
     DataBuffer<HeadingState> heading_state_buffer_;
     DataBuffer<MovementState> movement_state_buffer_;
+    DataBuffer<unitree_go::msg::dds_::WirelessController_> wireless_controller_buffer_;
     
     ChannelPublisherPtr<LowCmd_> lowcmd_publisher_;
     ChannelSubscriberPtr<LowState_> lowstate_subscriber_;
     ChannelSubscriberPtr<IMUState_> imutorso_subscriber_;
+    ChannelSubscriberPtr<unitree_go::msg::dds_::WirelessController_> wireless_controller_subscriber_;
     ThreadPtr input_thread_ptr_, command_writer_ptr_, control_thread_ptr_, planner_thread_ptr_;
     
     // =========================================================================
@@ -2259,6 +2262,10 @@ class G1Deploy {
       lowstate_subscriber_->InitChannel(std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1), 1);
       imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
       imutorso_subscriber_->InitChannel(std::bind(&G1Deploy::imuTorsoHandler, this, std::placeholders::_1), 1);
+      wireless_controller_subscriber_.reset(
+          new ChannelSubscriber<unitree_go::msg::dds_::WirelessController_>(HG_WIRELESS_CONTROLLER_TOPIC));
+      wireless_controller_subscriber_->InitChannel(
+          std::bind(&G1Deploy::WirelessControllerHandler, this, std::placeholders::_1), 1);
       // Load motion data
       if (motion_reader_.ReadFromCSV(motion_data_path)) {
         if (!motion_reader_.motions.empty()) {
@@ -2646,6 +2653,27 @@ class G1Deploy {
     void imuTorsoHandler(const void* message) {
       IMUState_ imu_torso = *(const IMUState_*)message;
       imu_torso_buffer_.SetData(imu_torso);
+    }
+
+    /// DDS callback: receives analog stick data from the Unitree wireless remote.
+    void WirelessControllerHandler(const void* message) {
+      const auto& wc = *(const unitree_go::msg::dds_::WirelessController_*)message;
+      wireless_controller_buffer_.SetData(wc);
+    }
+
+    void ApplyGamepadRemoteData(unitree::common::REMOTE_DATA_RX& gamepad_data) {
+      const auto low_state_data = low_state_buffer_.GetDataWithTime();
+      const auto wc_data = wireless_controller_buffer_.GetDataWithTime();
+      const bool wc_valid = wc_data.HasData() && wc_data.GetAgeMs() >= 0.0 && wc_data.GetAgeMs() < 500.0;
+      unitree::common::ApplyWirelessRemotePacket(
+          gamepad_data,
+          low_state_data.data ? &low_state_data.data->wireless_remote()[0] : nullptr,
+          wc_valid ? wc_data.data->lx() : 0.0f,
+          wc_valid ? wc_data.data->ly() : 0.0f,
+          wc_valid ? wc_data.data->rx() : 0.0f,
+          wc_valid ? wc_data.data->ry() : 0.0f,
+          wc_valid ? wc_data.data->keys() : static_cast<uint16_t>(0),
+          wc_valid);
     }
 
     /**
@@ -3409,45 +3437,28 @@ class G1Deploy {
      */
     void Input() {
       if (operator_state.stop) { return; }
-      
-      // Update input interface (poll for new data)
-      input_interface_->update();
-      
-      // Handle input using the interface - input handler updates everything directly
+
       const std::shared_ptr<const LowState_> low_state_data = low_state_buffer_.GetDataWithTime().data;
       std::array<double, 4> current_quat = {0.0, 0.0, 0.0, 1.0};
-      if(low_state_data) {
+      if (low_state_data) {
         current_quat = float_to_double<4>(low_state_data->imu_state().quaternion());
       }
-      
-      // Update gamepad data if using gamepad interface (or manager)
+
+      // Refresh gamepad packet before update() so analog sticks are current this frame.
       if (auto gamepad = dynamic_cast<unitree::common::Gamepad*>(input_interface_.get())) {
-        if(low_state_data) {
-          memcpy(gamepad->gamepad_data.buff, &low_state_data->wireless_remote()[0], 40);
-        }else{
-          for(int i = 0; i < 40; i++) {
-            gamepad->gamepad_data.buff[i] = 0;
-          }
-        }
+        ApplyGamepadRemoteData(gamepad->gamepad_data);
+      } else if (auto manager = dynamic_cast<InterfaceManager*>(input_interface_.get())) {
+        unitree::common::REMOTE_DATA_RX patched{};
+        ApplyGamepadRemoteData(patched);
+        manager->UpdateGamepadRemoteData(patched.buff, sizeof(patched.buff));
+      } else if (auto gamepad_mgr = dynamic_cast<GamepadManager*>(input_interface_.get())) {
+        unitree::common::REMOTE_DATA_RX patched{};
+        ApplyGamepadRemoteData(patched);
+        gamepad_mgr->UpdateGamepadRemoteData(patched.buff, sizeof(patched.buff));
       }
-      else if (auto manager = dynamic_cast<InterfaceManager*>(input_interface_.get())) {
-        if (low_state_data) {
-          manager->UpdateGamepadRemoteData(&low_state_data->wireless_remote()[0], 40);
-        } else {
-          uint8_t zeros[40] = {0};
-          manager->UpdateGamepadRemoteData(zeros, 40);
-        }
-      }
-      else if (auto gamepad_mgr = dynamic_cast<GamepadManager*>(input_interface_.get())) {
-        if (low_state_data) {
-          gamepad_mgr->UpdateGamepadRemoteData(&low_state_data->wireless_remote()[0], 40);
-        } else {
-          uint8_t zeros[40] = {0};
-          gamepad_mgr->UpdateGamepadRemoteData(zeros, 40);
-        }
-      }
-    
-     
+
+      // Poll input interface after wireless-remote data has been refreshed.
+      input_interface_->update();
       bool has_planner = static_cast<bool>(planner_);
       
       if (has_planner) {

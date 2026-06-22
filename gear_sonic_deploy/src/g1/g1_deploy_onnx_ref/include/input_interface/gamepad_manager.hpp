@@ -21,8 +21,9 @@
  *   D-Left  | Select Boxing motion set (IDEL_BOXING default)
  *   D-Right | Select Styled Walking motion set (LEDGE_WALKING default)
  *   F1      | Toggle ZMQ streaming
+ *   L2+R2   | Toggle reference-motion playback (exit/enter planner)
  *
- *   --- Standing / Squat / Styled sets (loop cycling) ---
+ *   Reference-motion mode (L2+R2): L1/R1=cycle clips, A=play, B=restart clip
  *   X       | Next mode in current set (wraps)
  *   Y       | Previous mode in current set (wraps)
  *   B       | Reset to set's default mode
@@ -103,6 +104,9 @@ class GamepadManager : public InputInterface {
       current_motion_set_ = get_motion_set(motion_set_index_);
       mode_index_in_set_ = 0;
       applyModeFromSet();
+
+      std::cout << "[GamepadManager] Start=planner locomotion | L2+R2=reference clips (dance/kick/etc) | keyboard M=same"
+                << std::endl;
     }
 
     void update() override {
@@ -113,6 +117,12 @@ class GamepadManager : public InputInterface {
       stop_control_ = false;
       reinitialize_ = false;
       planner_emergency_stop_ = false;
+      reference_motion_toggle_ = false;
+      l2_r2_chord_this_frame_ = false;
+      ref_motion_prev_ = false;
+      ref_motion_next_ = false;
+      ref_play_ = false;
+      ref_restart_ = false;
 
       // Handle stdin shortcuts for switching and emergency stop
       char ch;
@@ -138,6 +148,15 @@ class GamepadManager : public InputInterface {
             report_temperature_flag_ = true;
             is_manager_key = true;
             break;
+          case 'm':
+          case 'M':
+            reference_motion_mode_ = !reference_motion_mode_;
+            reference_motion_toggle_ = true;
+            is_manager_key = true;
+            std::cout << "[GamepadManager] Reference motion mode: "
+                      << (reference_motion_mode_ ? "ON (planner OFF)" : "OFF (planner ON)")
+                      << " (keyboard)" << std::endl;
+            break;
         }
 
         if (!is_manager_key && current_) {
@@ -147,6 +166,17 @@ class GamepadManager : public InputInterface {
 
       // Update gamepad data and buttons
       update_gamepad_data(gamepad_data_.RF_RX);
+
+      // L2+R2: toggle reference-motion playback vs planner locomotion
+      l2_r2_chord_this_frame_ =
+          (L2_.pressed && R2_.on_press) || (R2_.pressed && L2_.on_press);
+      if (l2_r2_chord_this_frame_) {
+        reference_motion_mode_ = !reference_motion_mode_;
+        reference_motion_toggle_ = true;
+        std::cout << "[GamepadManager] Reference motion mode: "
+                  << (reference_motion_mode_ ? "ON (planner OFF)" : "OFF (planner ON)")
+                  << " (L2+R2)" << std::endl;
+      }
 
       // F1 - Toggle ZMQ streaming
       bool trigger_ZMQ_toggle = false;
@@ -193,7 +223,11 @@ class GamepadManager : public InputInterface {
             zmq_->TriggerZMQToggle();
         }
       } else {
-        processGamepadPlannerControls();
+        if (reference_motion_mode_) {
+          processReferenceMotionControls();
+        } else {
+          processGamepadPlannerControls();
+        }
       }
     }
 
@@ -573,8 +607,34 @@ class GamepadManager : public InputInterface {
       }
     }
 
+    // Process reference-motion controls (L2+R2 mode)
+    void processReferenceMotionControls() {
+      if (start_.on_press) {
+        start_control_ = true;
+      }
+      if (select_.on_press) {
+        stop_control_ = true;
+      }
+      if (A_.on_press) {
+        ref_play_ = true;
+      }
+      if (B_.on_press) {
+        ref_restart_ = true;
+      }
+      if (L1_.on_press && !l2_r2_chord_this_frame_) {
+        ref_motion_prev_ = true;
+      }
+      if (R1_.on_press && !l2_r2_chord_this_frame_) {
+        ref_motion_next_ = true;
+      }
+    }
+
     // Process gamepad inputs for planner controls (called from update())
     void processGamepadPlannerControls() {
+      if (reference_motion_mode_) {
+        return;
+      }
+
       // Start button
       if (start_.on_press) {
         start_control_ = true;
@@ -726,8 +786,8 @@ class GamepadManager : public InputInterface {
           }
         }
 
-        // L2/R2 - Height control (squat set only)
-        if (motion_set_index_ == 1) {
+        // L2/R2 - Height control (squat set only; skip L2+R2 reference-mode chord)
+        if (motion_set_index_ == 1 && !l2_r2_chord_this_frame_) {
           if (L2_.on_press) {
             planner_use_height_ -= 0.1;
             planner_use_height_ = std::max(planner_use_height_, 0.2);
@@ -779,6 +839,91 @@ class GamepadManager : public InputInterface {
                                    PlannerState& planner_state,
                                    DataBuffer<MovementState>& movement_state_buffer,
                                    std::mutex& current_motion_mutex) {
+      // L2+R2 / keyboard M: switch between planner locomotion and reference clips
+      if (reference_motion_toggle_) {
+        reference_motion_toggle_ = false;
+        if (reference_motion_mode_) {
+          planner_state.enabled = false;
+          planner_state.initialized = false;
+          movement_state_buffer.SetData(
+              MovementState(static_cast<int>(LocomotionMode::IDLE),
+                            {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, -1.0f, -1.0f));
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex);
+            operator_state.play = false;
+            reinitialize_heading = true;
+            current_motion = motion_reader.GetMotionShared(motion_reader.current_motion_index_);
+            current_frame = 0;
+          }
+          std::cout << "[GamepadManager] Reference clips: L1/R1=cycle, A=play, B=restart, L2+R2=planner"
+                    << std::endl;
+        } else {
+          planner_state.enabled = true;
+          planner_facing_angle_ = 0.0;
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex);
+            operator_state.play = false;
+          }
+          std::cout << "[GamepadManager] Planner re-enabled (press Start if needed)" << std::endl;
+        }
+      }
+
+      if (reference_motion_mode_) {
+        if (ref_motion_prev_ && !motion_reader.motions.empty()) {
+          motion_reader.current_motion_index_ =
+              (motion_reader.current_motion_index_ - 1 + motion_reader.motions.size()) %
+              motion_reader.motions.size();
+          std::string motion_name;
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex);
+            operator_state.play = false;
+            current_motion = motion_reader.GetMotionShared(motion_reader.current_motion_index_);
+            current_frame = 0;
+            motion_name = current_motion->name;
+            reinitialize_heading = true;
+          }
+          std::cout << "[GamepadManager] Motion " << motion_reader.current_motion_index_ << ": "
+                    << motion_name << std::endl;
+        }
+
+        if (ref_motion_next_ && !motion_reader.motions.empty()) {
+          motion_reader.current_motion_index_ =
+              (motion_reader.current_motion_index_ + 1) % motion_reader.motions.size();
+          std::string motion_name;
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex);
+            operator_state.play = false;
+            current_motion = motion_reader.GetMotionShared(motion_reader.current_motion_index_);
+            current_frame = 0;
+            motion_name = current_motion->name;
+            reinitialize_heading = true;
+          }
+          std::cout << "[GamepadManager] Motion " << motion_reader.current_motion_index_ << ": "
+                    << motion_name << std::endl;
+        }
+
+        if (ref_play_) {
+          std::lock_guard<std::mutex> lock(current_motion_mutex);
+          operator_state.play = !operator_state.play;
+          std::cout << "[GamepadManager] " << (operator_state.play ? "Playing" : "Paused")
+                    << " motion " << motion_reader.current_motion_index_ << std::endl;
+        }
+
+        if (ref_restart_) {
+          std::lock_guard<std::mutex> lock(current_motion_mutex);
+          operator_state.play = false;
+          current_frame = 0;
+          reinitialize_heading = true;
+          std::cout << "[GamepadManager] Restart motion "
+                    << motion_reader.current_motion_index_ << " at frame 0" << std::endl;
+        }
+
+        if (start_control_) {
+          operator_state.start = true;
+        }
+        return;
+      }
+
       // Handle safety reset from interface manager
       if (CheckAndClearSafetyReset()) {
         {
@@ -1020,6 +1165,14 @@ class GamepadManager : public InputInterface {
     bool stop_control_ = false;            ///< Select-button pressed this frame.
     bool reinitialize_ = false;            ///< X/Y-button reinitialize heading.
     bool planner_emergency_stop_ = false;  ///< A-button emergency stop.
+
+    bool reference_motion_mode_ = false;   ///< True when playing reference clips instead of planner.
+    bool reference_motion_toggle_ = false; ///< Mode changed this frame (L2+R2 or keyboard M).
+    bool l2_r2_chord_this_frame_ = false; ///< L2+R2 pressed together this frame.
+    bool ref_motion_prev_ = false;
+    bool ref_motion_next_ = false;
+    bool ref_play_ = false;
+    bool ref_restart_ = false;
 
     // ------------------------------------------------------------------
     // Gamepad hardware state
