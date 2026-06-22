@@ -489,6 +489,16 @@ set +e  # Temporarily allow errors (for jetson_clocks on non-Jetson systems)
 source scripts/setup_env.sh
 set -e  # Re-enable exit on error
 
+# ROS2 headers break g++ builds on some systems; only enable for ros2 input.
+if [[ "$INPUT_TYPE" != "ros2" ]]; then
+    export HAS_ROS2=0
+    # Prefer Unitree's bundled CycloneDDS over ROS2's libddsc (mixing them crashes at runtime).
+    UNITREE_DDS_LIB="$SCRIPT_DIR/thirdparty/unitree_sdk2/thirdparty/lib/$(uname -m)"
+    if [[ -d "$UNITREE_DDS_LIB" ]]; then
+        export LD_LIBRARY_PATH="$UNITREE_DDS_LIB:$LD_LIBRARY_PATH"
+    fi
+fi
+
 # Always build to ensure we have the latest version
 echo "Building the project..."
 just build

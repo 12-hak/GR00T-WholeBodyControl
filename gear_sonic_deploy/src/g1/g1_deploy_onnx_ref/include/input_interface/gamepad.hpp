@@ -30,6 +30,7 @@
 #include <thread>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include "input_interface.hpp"
 
 #ifndef M_PI
@@ -98,6 +99,56 @@ typedef union {
     xRockerBtnDataStruct RF_RX;
     uint8_t buff[40] = {0};
 } REMOTE_DATA_RX;
+
+inline bool GamepadSticksNearZero(const xRockerBtnDataStruct& key_data) {
+  return std::fabs(key_data.lx) < 0.01f && std::fabs(key_data.ly) < 0.01f &&
+         std::fabs(key_data.rx) < 0.01f && std::fabs(key_data.ry) < 0.01f;
+}
+
+/// Merge LowState wireless_remote bytes with optional rt/wirelesscontroller sticks/keys.
+inline void ApplyWirelessRemotePacket(
+    REMOTE_DATA_RX& gamepad_data,
+    const uint8_t* wireless_remote,
+    float wc_lx,
+    float wc_ly,
+    float wc_rx,
+    float wc_ry,
+    uint16_t wc_keys,
+    bool wc_valid) {
+  if (wireless_remote) {
+    std::memcpy(gamepad_data.buff, wireless_remote, 40);
+  } else {
+    std::memset(gamepad_data.buff, 0, sizeof(gamepad_data.buff));
+  }
+
+  if (!wc_valid) {
+    return;
+  }
+
+  if (wc_keys != 0) {
+    gamepad_data.RF_RX.btn.value = wc_keys;
+  }
+
+  const bool wc_sticks_active =
+      std::fabs(wc_lx) > 0.01f || std::fabs(wc_ly) > 0.01f ||
+      std::fabs(wc_rx) > 0.01f || std::fabs(wc_ry) > 0.01f;
+
+  // G1 often publishes buttons in LowState.wireless_remote but analog sticks on rt/wirelesscontroller.
+  if (wc_sticks_active) {
+    gamepad_data.RF_RX.lx = wc_lx;
+    gamepad_data.RF_RX.ly = wc_ly;
+    gamepad_data.RF_RX.rx = wc_rx;
+    gamepad_data.RF_RX.ry = wc_ry;
+    return;
+  }
+
+  if (GamepadSticksNearZero(gamepad_data.RF_RX)) {
+    gamepad_data.RF_RX.lx = wc_lx;
+    gamepad_data.RF_RX.ly = wc_ly;
+    gamepad_data.RF_RX.rx = wc_rx;
+    gamepad_data.RF_RX.ry = wc_ry;
+  }
+}
 
 /**
  * @brief Simple edge-detecting button helper.
@@ -185,7 +236,7 @@ class Gamepad : public InputInterface {
      * - X/Y Buttons   - Reinitialize base quaternion and delta heading
      * - Start Button  - Start control
      * - Select Button - Emergency Stop (kills all motion)
-     * - F1 Button - Toggle planner on/off
+     * - F1 / F2 / L1+R1 - Toggle planner on/off
      * - D-pad L/R     - Delta heading left/right (+/-0.1 rad)
      * 
      * Non-Planner Mode:
@@ -227,6 +278,12 @@ class Gamepad : public InputInterface {
       // Process gamepad input and set flags based on current button states
       update_gamepad_data(gamepad_data.RF_RX);
 
+      // Alternate planner toggles when F1 is unreachable on some remotes.
+      const bool l1_r1_planner_toggle =
+          (L1.pressed && R1.on_press) || (R1.pressed && L1.on_press);
+      const bool planner_toggle_request =
+          F1.on_press || F2.on_press || l1_r1_planner_toggle;
+
       // Debug: Log analog stick values if they're above dead zone
       if constexpr (DEBUG_LOGGING) {
         if (std::abs(lx) > dead_zone || std::abs(ly) > dead_zone) {
@@ -261,14 +318,14 @@ class Gamepad : public InputInterface {
             std::cout << "[GAMEPAD DEBUG] A pressed - Play/Pause motion" << std::endl;
           }
         }
-        // L1/R1 -Motion prev/next
-        if (L1.on_press) { 
+        // L1/R1 -Motion prev/next (skip when using L1+R1 planner toggle chord)
+        if (L1.on_press && !l1_r1_planner_toggle) { 
           motion_prev = true; 
           if constexpr (DEBUG_LOGGING) {
             std::cout << "[GAMEPAD DEBUG] L1 pressed - Previous motion" << std::endl;
           }
         }
-        if (R1.on_press) { 
+        if (R1.on_press && !l1_r1_planner_toggle) { 
           motion_next = true; 
           if constexpr (DEBUG_LOGGING) {
             std::cout << "[GAMEPAD DEBUG] R1 pressed - Next motion" << std::endl;
@@ -297,8 +354,8 @@ class Gamepad : public InputInterface {
             std::cout << "[GAMEPAD DEBUG] B pressed - Planner emergency stop" << std::endl;
           }
         }
-        // L1/R1 - change movement mode
-        if (L1.on_press) { 
+        // L1/R1 - change movement mode (skip when using L1+R1 planner toggle chord)
+        if (L1.on_press && !l1_r1_planner_toggle) { 
           planner_use_movement_mode -= 1; 
           if (planner_use_movement_mode < 0) { planner_use_movement_mode = 6; }
           // If movement mode is 6, i.e. switch from idle to kneel, set height to 0.8
@@ -307,7 +364,7 @@ class Gamepad : public InputInterface {
             std::cout << "[GAMEPAD DEBUG] L1 pressed - Movement mode changed to: " << planner_use_movement_mode << std::endl;
           }
         }
-        if (R1.on_press) { 
+        if (R1.on_press && !l1_r1_planner_toggle) { 
           planner_use_movement_mode += 1; 
           if (planner_use_movement_mode > 6) { planner_use_movement_mode = 0; }
           // If movement mode is 4, i.e. switch from run to squat, set height to 0.8
@@ -415,12 +472,11 @@ class Gamepad : public InputInterface {
       }
 
 
-      // F1 - Toggle planner
-      if (F1.on_press) { 
-        use_planner = !use_planner; 
-        if constexpr (DEBUG_LOGGING) {
-          std::cout << "[GAMEPAD DEBUG] F1 pressed - Planner toggled to: " << (use_planner ? "ON" : "OFF") << std::endl;
-        }
+      // Toggle planner: F1, F2, or L1+R1 chord
+      if (planner_toggle_request) {
+        use_planner = !use_planner;
+        const char* via = F1.on_press ? "F1" : (F2.on_press ? "F2" : "L1+R1");
+        std::cout << "[Gamepad] " << via << " - Planner mode: " << (use_planner ? "ON" : "OFF") << std::endl;
       }
 
       // start - Start control
